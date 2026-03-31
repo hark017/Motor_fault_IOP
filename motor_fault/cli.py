@@ -1,0 +1,84 @@
+"""CLI entry points for local checks and Raspberry Pi deployment."""
+
+from __future__ import annotations
+
+import argparse
+import json
+
+from .app import MotorFaultMonitor, configure_logging
+from .config import AppConfig
+from .predictor import MotorFaultPredictor
+from .sensors import build_sensor_reader
+
+
+def _cmd_predict(args: argparse.Namespace) -> int:
+    predictor = MotorFaultPredictor(AppConfig().model_dir)
+    results = predictor.predict(args.i1, args.i2, args.i3)
+    payload = {
+        task: {
+            "class_id": result.class_id,
+            "label": result.label,
+            "probabilities": result.probabilities,
+        }
+        for task, result in results.items()
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=True))
+    return 0
+
+
+def _cmd_test_sensors(args: argparse.Namespace) -> int:
+    config = AppConfig()
+    reader = build_sensor_reader(config)
+    reader.open()
+    try:
+        for index in range(args.samples):
+            sample = reader.read_currents()
+            print(f"sample {index + 1}: {sample.currents}")
+    finally:
+        reader.close()
+    return 0
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    configure_logging(verbose=args.verbose)
+    monitor = MotorFaultMonitor(AppConfig())
+    monitor.open()
+    try:
+        if args.once:
+            print(json.dumps(monitor.run_once(), indent=2, ensure_ascii=True))
+        else:
+            monitor.run_forever()
+    finally:
+        monitor.close()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="3-phase motor fault monitor")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    predict = subparsers.add_parser("predict", help="Run model inference on 3 currents")
+    predict.add_argument("--i1", required=True, type=float)
+    predict.add_argument("--i2", required=True, type=float)
+    predict.add_argument("--i3", required=True, type=float)
+    predict.set_defaults(func=_cmd_predict)
+
+    test_sensors = subparsers.add_parser("test-sensors", help="Read raw sensor values")
+    test_sensors.add_argument("--samples", default=3, type=int)
+    test_sensors.set_defaults(func=_cmd_test_sensors)
+
+    run = subparsers.add_parser("run", help="Run the monitor")
+    run.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    run.add_argument("--verbose", action="store_true")
+    run.set_defaults(func=_cmd_run)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

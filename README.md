@@ -1,314 +1,653 @@
-# Motor_fault_predictions
-## Step 1: Enable UART on RPi
+# Motor Fault Predictions
+
+This repository contains deployment code for a 3-phase induction motor fault detection system built around the already-trained XGBoost models in this repo.
+
+## 1. Project Overview
+
+This project uses three phase-current measurements from a 3-phase induction motor:
+
+- `I1`
+- `I2`
+- `I3`
+
+From those three values, the system generates the same 8 features used during training:
+
+1. `I1`
+2. `I2`
+3. `I3`
+4. `I1 + I2 + I3`
+5. `max(abs(I1), abs(I2), abs(I3))`
+6. `min(abs(I1), abs(I2), abs(I3))`
+7. `max(abs currents) - min(abs currents)`
+8. `std(I1, I2, I3)`
+
+These 8 features are passed into the saved scaler and models already present in this repository.
+
+The deployed system predicts:
+
+- `binary`: Healthy or Faulty
+- `severity`: Healthy / `1u` / `3u` / `5u`
+- `phase`: Healthy / Phase 1 / Phase 2 / Phase 3
+- `load`: No Load / Half Load / Full Load
+
+Important: the models are already trained. This deployment setup improves the inference and hardware-integration side only.
+
+## 2. What Is In This Repository
+
+Key files:
+
+- `model_binary.joblib`, `model_severity.joblib`, `model_phase.joblib`, `model_load.joblib`
+- `scaler.joblib`
+- `motor_fault/`
+- `motor_monitor.py`
+- `test_sensors.py`
+- `.env.example`
+- `requirements.txt`
+- `requirements-rpi.txt`
+- `tests/`
+
+## 3. Deployment Modes Supported
+
+The code supports two hardware connection styles.
+
+### Option A: `multiplexed_uart`
+
+Use this when:
+
+- all three sensors share one Raspberry Pi UART line
+- you enable one sensor at a time using GPIO reset pins
+
+This is the mode your earlier README example was based on.
+
+You will need:
+
+- Raspberry Pi UART enabled
+- one UART receive path
+- three GPIO pins connected to the sensors' reset/enable logic
+
+### Option B: `multi_usb`
+
+Use this when:
+
+- each sensor has its own USB-to-UART adapter
+- each sensor appears as a separate serial port such as:
+  - `/dev/ttyUSB0`
+  - `/dev/ttyUSB1`
+  - `/dev/ttyUSB2`
+
+This mode is usually simpler to debug because each sensor is independent.
+
+## 4. Hardware You Need
+
+Before deployment, make sure you have:
+
+- Raspberry Pi with Raspberry Pi OS
+- microSD card with OS installed
+- stable power supply for Raspberry Pi
+- 3 current sensors
+- motor setup with 3 measurable phase currents
+- jumper wires
+- common ground where required by your hardware setup
+- internet connection if you want ThingSpeak upload
+
+Depending on your setup, also prepare:
+
+- USB-to-UART converters for `multi_usb`, or
+- direct Raspberry Pi UART plus GPIO control wiring for `multiplexed_uart`
+
+## 5. Step-By-Step Deployment Guide
+
+This is the full deployment workflow for actual hardware.
+
+### Step 1: Copy the Project to Raspberry Pi
+
+Move this project folder to the Pi.
+
+Examples:
+
+```bash
+scp -r Motor_fault_predictions pi@<RASPBERRY_PI_IP>:/home/pi/
+```
+
+or clone it using git if the repository is hosted.
+
+Then log into the Pi:
+
+```bash
+ssh pi@<RASPBERRY_PI_IP>
+cd /home/pi/Motor_fault_predictions
+```
+
+### Step 2: Update the Raspberry Pi
+
+Update packages before installing Python dependencies:
+
+```bash
+sudo apt update
+sudo apt upgrade -y
+```
+
+### Step 3: Install Required System Packages
+
+Install Python tools and serial support:
+
+```bash
+sudo apt install -y python3 python3-pip python3-venv
+```
+
+If your serial devices need additional support packages, keep the normal Raspberry Pi serial stack enabled.
+
+### Step 4: Decide Which Wiring Mode You Are Using
+
+Choose one mode before editing variables:
+
+- choose `multiplexed_uart` if the 3 sensors share one UART and are selected one at a time using GPIO reset pins
+- choose `multi_usb` if each sensor is connected through its own USB serial adapter
+
+This choice changes:
+
+- the wiring
+- the variables you must edit
+- how sensor debugging is performed
+
+### Step 5: If Using `multiplexed_uart`, Enable UART on the Pi
+
+Run:
 
 ```bash
 sudo raspi-config
 ```
-- Go to **Interface Options** → **Serial Port**
-- Login shell over serial: **No**
-- Serial port hardware enabled: **Yes**
-- Reboot: `sudo reboot`
 
-## Step 2: Install Dependencies
+Then:
 
-```bash
-sudo apt update
-sudo apt install python3-pip
-pip3 install pyserial RPi.GPIO numpy joblib requests
-```
+1. Go to `Interface Options`
+2. Open `Serial Port`
+3. Set `Login shell over serial` to `No`
+4. Set `Serial port hardware enabled` to `Yes`
+5. Exit and reboot
 
-## Step 3: Test Script
-
-Save this as `test_sensors.py`:
-
-```python
-#!/usr/bin/env python3
-import serial
-import time
-import RPi.GPIO as GPIO
-
-# RST pins
-RST_PINS = {
-    'I1': 17,  # Pin 11
-    'I2': 27,  # Pin 13
-    'I3': 22,  # Pin 15
-}
-
-# Setup GPIO
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-
-for pin in RST_PINS.values():
-    GPIO.setup(pin, GPIO.OUT)
-    GPIO.output(pin, GPIO.HIGH)
-
-# Open UART
-ser = serial.Serial('/dev/serial0', 9600, timeout=1)
-time.sleep(0.5)
-
-def read_sensor(name):
-    # Disable all sensors
-    for n, pin in RST_PINS.items():
-        GPIO.output(pin, GPIO.LOW)
-    
-    time.sleep(0.05)
-    
-    # Enable only this sensor
-    GPIO.output(RST_PINS[name], GPIO.HIGH)
-    time.sleep(0.1)
-    
-    # Clear buffer and read
-    ser.reset_input_buffer()
-    time.sleep(0.2)
-    
-    # Try to read
-    for _ in range(5):
-        line = ser.readline().decode('ascii', errors='ignore').strip()
-        if line:
-            print(f"  {name} raw: '{line}'")
-            try:
-                if line[0] in '~+-':
-                    value = float(line[1:])
-                    if line[0] == '-':
-                        value = -value
-                    return value
-                else:
-                    return float(line)
-            except:
-                pass
-    return None
-
-print("="*40)
-print("Testing DWCS2200 Sensors")
-print("="*40)
-
-try:
-    while True:
-        print("\nReading sensors...")
-        
-        I1 = read_sensor('I1')
-        I2 = read_sensor('I2')
-        I3 = read_sensor('I3')
-        
-        print(f"\nResults:")
-        print(f"  I1 = {I1} A")
-        print(f"  I2 = {I2} A")
-        print(f"  I3 = {I3} A")
-        
-        # Re-enable all
-        for pin in RST_PINS.values():
-            GPIO.output(pin, GPIO.HIGH)
-        
-        time.sleep(2)
-
-except KeyboardInterrupt:
-    print("\nStopped")
-finally:
-    GPIO.cleanup()
-    ser.close()
-```
-
-## Step 4: Run Test
+Reboot:
 
 ```bash
-python3 test_sensors.py
+sudo reboot
 ```
 
-**Expected Output:**
-```
-========================================
-Testing DWCS2200 Sensors
-========================================
+After reboot, log in again and return to the project folder.
 
-Reading sensors...
-  I1 raw: '~0.000'
-  I2 raw: '~0.000'
-  I3 raw: '~0.000'
+### Step 6: Connect the Hardware
 
-Results:
-  I1 = 0.0 A
-  I2 = 0.0 A
-  I3 = 0.0 A
-```
+The exact wiring depends on your sensor module and interface board, but the deployment logic is:
 
-## Troubleshooting
+For `multiplexed_uart`:
 
-| Problem | Solution |
-|---------|----------|
-| No output | Check VDD/GND connections |
-| Garbage data | Check TX wire to Pin 10 |
-| Only one sensor works | Check RST pin connections |
-| Permission denied | Run with `sudo python3 test_sensors.py` |
+- all sensors share the same UART data path used by the Pi
+- only one sensor should be enabled at a time
+- three Raspberry Pi GPIO pins control which sensor is active
+- the reset/enable pins must match the values you set in `.env`
 
-## Step 5: Full Inference Code
+For `multi_usb`:
 
-Once test works, save this as `motor_monitor.py`:
+- each sensor connects to a separate USB-to-UART adapter
+- each adapter appears as a separate device path
+- you will map each physical phase to:
+  - `I1`
+  - `I2`
+  - `I3`
 
-```python
-#!/usr/bin/env python3
-import serial
-import time
-import numpy as np
-import joblib
-import requests
-import RPi.GPIO as GPIO
+Important deployment rule:
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-RST_PINS = {'I1': 17, 'I2': 27, 'I3': 22}
-UART_PORT = '/dev/serial0'
-BAUD_RATE = 9600
+- keep your phase naming consistent all the way through wiring, variable setup, and testing
 
-THINGSPEAK_API_KEY = 'YOUR_API_KEY_HERE'  # <-- UPDATE THIS
-THINGSPEAK_URL = 'https://api.thingspeak.com/update'
+That means:
 
-MODEL_DIR = 'trained_models'
-SAMPLE_INTERVAL = 15
+- the sensor physically measuring motor phase 1 must remain `I1`
+- the sensor physically measuring motor phase 2 must remain `I2`
+- the sensor physically measuring motor phase 3 must remain `I3`
 
-# =============================================================================
-# SETUP
-# =============================================================================
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-for pin in RST_PINS.values():
-    GPIO.setup(pin, GPIO.OUT)
-    GPIO.output(pin, GPIO.HIGH)
+### Step 7: Create a Python Virtual Environment
 
-ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=1)
-time.sleep(0.5)
-
-# =============================================================================
-# FUNCTIONS
-# =============================================================================
-def read_sensor(name):
-    for pin in RST_PINS.values():
-        GPIO.output(pin, GPIO.LOW)
-    time.sleep(0.05)
-    GPIO.output(RST_PINS[name], GPIO.HIGH)
-    time.sleep(0.1)
-    ser.reset_input_buffer()
-    time.sleep(0.2)
-    
-    for _ in range(5):
-        line = ser.readline().decode('ascii', errors='ignore').strip()
-        if line:
-            try:
-                if line[0] in '~+-':
-                    value = float(line[1:])
-                    return -value if line[0] == '-' else value
-                return float(line)
-            except:
-                pass
-    return None
-
-def read_all():
-    I1 = read_sensor('I1')
-    I2 = read_sensor('I2')
-    I3 = read_sensor('I3')
-    for pin in RST_PINS.values():
-        GPIO.output(pin, GPIO.HIGH)
-    return I1, I2, I3
-
-def compute_features(I1, I2, I3):
-    I_sum = I1 + I2 + I3
-    I_max = max(abs(I1), abs(I2), abs(I3))
-    I_min = min(abs(I1), abs(I2), abs(I3))
-    I_range = I_max - I_min
-    I_std = np.std([I1, I2, I3])
-    return np.array([[I1, I2, I3, I_sum, I_max, I_min, I_range, I_std]], dtype=np.float32)
-
-def upload(I1, I2, I3, preds):
-    params = {
-        'api_key': THINGSPEAK_API_KEY,
-        'field1': f"{I1:.3f}",
-        'field2': f"{I2:.3f}",
-        'field3': f"{I3:.3f}",
-        'field4': preds['binary'],
-        'field5': preds['severity'],
-        'field6': preds['phase'],
-        'field7': preds['load']
-    }
-    try:
-        r = requests.get(THINGSPEAK_URL, params=params, timeout=10)
-        if r.status_code == 200 and r.text != '0':
-            print(f"  ThingSpeak: OK (entry {r.text})")
-        else:
-            print(f"  ThingSpeak: Failed")
-    except Exception as e:
-        print(f"  ThingSpeak Error: {e}")
-
-# =============================================================================
-# LOAD MODELS
-# =============================================================================
-print("Loading models...")
-scaler = joblib.load(f'{MODEL_DIR}/scaler.joblib')
-models = {
-    'binary': joblib.load(f'{MODEL_DIR}/model_binary.joblib'),
-    'severity': joblib.load(f'{MODEL_DIR}/model_severity.joblib'),
-    'phase': joblib.load(f'{MODEL_DIR}/model_phase.joblib'),
-    'load': joblib.load(f'{MODEL_DIR}/model_load.joblib')
-}
-
-LABELS = {
-    'binary': {0: 'Healthy', 1: 'Faulty'},
-    'severity': {0: 'Healthy', 1: '1μ', 2: '3μ', 3: '5μ'},
-    'phase': {0: 'Healthy', 1: 'Phase 1', 2: 'Phase 2', 3: 'Phase 3'},
-    'load': {0: 'No Load', 1: 'Half Load', 2: 'Full Load'}
-}
-
-print("Models loaded!")
-
-# =============================================================================
-# MAIN LOOP
-# =============================================================================
-print("="*50)
-print("Motor Fault Detection System - Running")
-print("="*50)
-
-try:
-    while True:
-        I1, I2, I3 = read_all()
-        
-        if None in (I1, I2, I3):
-            print(f"Sensor error: I1={I1}, I2={I2}, I3={I3}")
-            time.sleep(SAMPLE_INTERVAL)
-            continue
-        
-        # Predict
-        X = compute_features(I1, I2, I3)
-        X_scaled = scaler.transform(X)
-        
-        preds = {}
-        for task, model in models.items():
-            preds[task] = int(model.predict(X_scaled)[0])
-        
-        # Display
-        print(f"\nCurrents: I1={I1:.3f}A  I2={I2:.3f}A  I3={I3:.3f}A")
-        print(f"  Binary:   {LABELS['binary'][preds['binary']]}")
-        print(f"  Severity: {LABELS['severity'][preds['severity']]}")
-        print(f"  Phase:    {LABELS['phase'][preds['phase']]}")
-        print(f"  Load:     {LABELS['load'][preds['load']]}")
-        
-        # Upload
-        upload(I1, I2, I3, preds)
-        
-        time.sleep(SAMPLE_INTERVAL)
-
-except KeyboardInterrupt:
-    print("\nStopping...")
-finally:
-    ser.close()
-    GPIO.cleanup()
-    print("Done")
-```
-
-## Step 6: Run
+Inside the project directory:
 
 ```bash
-# First update your ThingSpeak API key in the code
-# Then run:
-python3 motor_monitor.py
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-Does the test script work? Let me know the output.
+You should now see your shell running inside `.venv`.
+
+### Step 8: Install Python Dependencies
+
+On Raspberry Pi use:
+
+```bash
+pip install --upgrade pip
+pip install -r requirements-rpi.txt
+```
+
+This installs:
+
+- `numpy`
+- `joblib`
+- `xgboost`
+- `scikit-learn`
+- `requests`
+- `pyserial`
+- `pytest`
+- `RPi.GPIO`
+
+### Step 9: Create Your Deployment Variables File
+
+Copy the template:
+
+```bash
+cp .env.example .env
+```
+
+Now open `.env` in an editor:
+
+```bash
+nano .env
+```
+
+### Step 10: Fill In the Variables in `.env`
+
+Below is what each variable means.
+
+#### Core mode selection
+
+```bash
+SENSOR_MODE=multiplexed_uart
+```
+
+Use:
+
+- `multiplexed_uart` for shared UART + GPIO selection
+- `multi_usb` for three separate serial ports
+
+#### UART settings
+
+```bash
+UART_PORT=/dev/serial0
+BAUD_RATE=9600
+SERIAL_TIMEOUT=1.0
+```
+
+Use these for:
+
+- UART port name
+- serial baud rate
+- read timeout
+
+Normally keep `BAUD_RATE=9600` unless your hardware requires something else.
+
+#### Sample timing
+
+```bash
+SAMPLE_INTERVAL=15
+```
+
+This is how often the monitor performs one inference cycle.
+
+Why `15` seconds:
+
+- ThingSpeak free tier typically requires about 15 seconds between uploads
+- it is a safe default for cloud logging
+
+#### GPIO pin variables for `multiplexed_uart`
+
+```bash
+I1_RST_PIN=17
+I2_RST_PIN=27
+I3_RST_PIN=22
+```
+
+These must match the Raspberry Pi GPIO pins physically connected to the enable/reset lines for the three sensors.
+
+If your wiring uses different GPIO pins, replace these values.
+
+#### Serial port variables for `multi_usb`
+
+```bash
+I1_PORT=/dev/ttyUSB0
+I2_PORT=/dev/ttyUSB1
+I3_PORT=/dev/ttyUSB2
+```
+
+These should match the actual USB serial devices on your Raspberry Pi.
+
+To check connected serial devices:
+
+```bash
+ls /dev/ttyUSB*
+```
+
+If the device names change after reboot or reconnection, you may later want persistent udev rules, but first get the system working with direct paths.
+
+#### ThingSpeak variables
+
+```bash
+THINGSPEAK_ENABLED=false
+THINGSPEAK_API_KEY=REPLACE_WITH_YOUR_THINGSPEAK_WRITE_API_KEY
+THINGSPEAK_URL=https://api.thingspeak.com/update
+```
+
+Use:
+
+- `THINGSPEAK_ENABLED=false` while first validating hardware locally
+- `THINGSPEAK_ENABLED=true` after sensor readings and predictions are stable
+- replace `THINGSPEAK_API_KEY` with the real write API key
+
+### Step 11: Export the Variables Into the Shell
+
+The current code reads environment variables directly. A simple way to load them is:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+Run these commands in every new shell session before starting the app, unless you later automate it with `systemd` or a shell profile.
+
+### Step 12: Confirm the Model Files Exist
+
+Check that these files are present:
+
+```bash
+ls
+```
+
+You should see:
+
+- `scaler.joblib`
+- `model_binary.joblib`
+- `model_severity.joblib`
+- `model_phase.joblib`
+- `model_load.joblib`
+
+The code automatically searches:
+
+1. `MODEL_DIR` if you set it
+2. `trained_models/`
+3. repository root
+
+So with the current repository structure, no model move is required.
+
+### Step 13: Run a Pure Software Inference Test First
+
+Before testing sensors, verify that Python, scaler, and model loading all work:
+
+```bash
+python motor_monitor.py predict --i1 -2.23046875 --i2 0.51171875 --i3 1.58984375
+```
+
+This should print JSON with all four prediction tasks.
+
+If this step fails, do not move to hardware testing yet. Fix the Python environment first.
+
+### Step 14: Check That the Pi Can See the Serial Devices
+
+For `multi_usb`:
+
+```bash
+ls /dev/ttyUSB*
+```
+
+For `multiplexed_uart`:
+
+```bash
+ls -l /dev/serial0
+```
+
+If your expected serial devices are missing:
+
+- re-check wiring
+- re-check UART enable settings
+- re-check USB adapter detection
+- re-check power to the sensors
+
+### Step 15: Run the Raw Sensor Test
+
+This is the most important hardware validation step before live monitoring.
+
+Run:
+
+```bash
+python test_sensors.py
+```
+
+This reads and prints raw current values without running the full monitoring loop.
+
+What you want to confirm:
+
+- all three channels return values
+- the values are not empty
+- the values are not random garbage text
+- the phase-to-sensor mapping is correct
+
+If the motor is off, values may be close to zero.
+
+If the motor is on, you should see meaningful current readings for all three phases.
+
+### Step 16: Troubleshoot Sensor Read Problems If Needed
+
+If `test_sensors.py` does not work, check these one by one.
+
+If you get no output:
+
+- check power to sensor modules
+- check ground reference
+- check serial wiring
+- check selected serial device path
+- check UART enable on Pi
+
+If you get unreadable characters:
+
+- check baud rate
+- check serial line wiring
+- check whether the sensor output format matches the expected ASCII numeric format
+
+If only one sensor works in `multiplexed_uart` mode:
+
+- check `I1_RST_PIN`, `I2_RST_PIN`, `I3_RST_PIN`
+- check whether only one enable/reset path is actually switching
+- check that each physical sensor is connected to the correct gate/reset line
+
+If only one sensor works in `multi_usb` mode:
+
+- check each `/dev/ttyUSBx` device one by one
+- swap adapters or cables to isolate whether the issue is the sensor or the USB interface
+
+Only proceed after all three currents can be read reliably.
+
+### Step 17: Run One Full Inference Cycle
+
+Once raw sensor reading works, run:
+
+```bash
+python motor_monitor.py run --once
+```
+
+This performs:
+
+1. sensor read
+2. feature generation
+3. model inference
+4. optional ThingSpeak upload
+
+What to verify:
+
+- all three currents appear in output
+- all prediction tasks are present
+- no serial read exception occurs
+- no model loading exception occurs
+
+### Step 18: Start Continuous Monitoring
+
+When the one-cycle test is good, run:
+
+```bash
+python motor_monitor.py
+```
+
+This starts the continuous loop using the interval from:
+
+```bash
+SAMPLE_INTERVAL
+```
+
+### Step 19: Enable ThingSpeak Only After Local Validation
+
+Once local monitoring is stable:
+
+1. edit `.env`
+2. set:
+
+```bash
+THINGSPEAK_ENABLED=true
+THINGSPEAK_API_KEY=YOUR_REAL_API_KEY
+```
+
+3. reload the environment:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+4. run:
+
+```bash
+python motor_monitor.py run --once
+```
+
+Then verify that data appears in your ThingSpeak channel.
+
+### Step 20: Run Tests on the Pi
+
+If you want to verify the software stack on the Pi:
+
+```bash
+pytest -q
+```
+
+These tests validate:
+
+- feature engineering
+- model loading
+- sensor value parsing
+- ThingSpeak payload formatting
+
+They do not test the real physical hardware connections.
+
+## 6. Recommended Real Deployment Order
+
+Follow this exact order:
+
+1. move project to Pi
+2. install OS packages
+3. create `.venv`
+4. install `requirements-rpi.txt`
+5. fill `.env`
+6. export variables
+7. run software-only prediction command
+8. confirm serial devices are visible
+9. run `python test_sensors.py`
+10. fix all sensor issues
+11. run `python motor_monitor.py run --once`
+12. run `python motor_monitor.py`
+13. enable ThingSpeak after local validation succeeds
+
+## 7. Important Notes About Real Hardware Deployment
+
+### Keep phase wiring consistent
+
+Do not change phase naming between:
+
+- the physical wiring
+- the variable names
+- the interpretation of predictions
+
+If you accidentally swap `I1`, `I2`, and `I3`, the model may still produce outputs, but the predicted faulty phase could be misleading relative to the actual motor phase.
+
+### Validate with healthy condition first
+
+Before testing faulty conditions:
+
+- first run the system on a healthy motor state
+- confirm readings are stable
+- confirm the app runs continuously without sensor failures
+
+### Add cloud upload last
+
+Do not begin with cloud upload enabled.
+
+First confirm:
+
+- serial reading works
+- predictions are produced
+- loop timing is stable
+
+Then enable cloud upload.
+
+### Saved model compatibility
+
+The local validation was done successfully with:
+
+- `xgboost==2.0.3`
+- `scikit-learn==1.6.1`
+
+These versions are pinned in the requirements files for that reason.
+
+## 8. Useful Commands
+
+Activate environment:
+
+```bash
+source .venv/bin/activate
+```
+
+Load `.env` variables:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+Software-only prediction:
+
+```bash
+python motor_monitor.py predict --i1 -2.23046875 --i2 0.51171875 --i3 1.58984375
+```
+
+Raw sensor test:
+
+```bash
+python test_sensors.py
+```
+
+Run one full cycle:
+
+```bash
+python motor_monitor.py run --once
+```
+
+Run continuously:
+
+```bash
+python motor_monitor.py
+```
+
+Run tests:
+
+```bash
+pytest -q
+```
+
+## 9. If You Want To Automate Startup Later
+
+After you validate everything manually, the next natural step is to create a `systemd` service so the monitor starts automatically on boot.
+
+That is not included yet in this README because manual deployment and sensor validation should come first.
