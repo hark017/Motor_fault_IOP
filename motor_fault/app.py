@@ -10,7 +10,7 @@ from typing import Dict, Optional
 from .cloud import ThingSpeakUploader
 from .config import AppConfig
 from .predictor import MotorFaultPredictor, PredictionResult
-from .sensors import CurrentSample, build_sensor_reader
+from .sensors import CurrentSample, SensorReadError, build_sensor_reader
 
 
 LOGGER = logging.getLogger("motor_fault")
@@ -60,8 +60,11 @@ class MotorFaultMonitor:
     def run_forever(self) -> None:
         while True:
             started = time.time()
-            result = self.run_once()
-            LOGGER.info(json.dumps(result, ensure_ascii=True))
+            try:
+                result = self.run_once()
+                LOGGER.info(json.dumps(result, ensure_ascii=True))
+            except SensorReadError as exc:
+                LOGGER.error("Sensor read failed: %s", exc)
             elapsed = time.time() - started
             time.sleep(max(0.0, self.config.sample_interval - elapsed))
 

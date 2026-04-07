@@ -35,6 +35,10 @@ class CurrentSample:
     timestamp: float
 
 
+class SensorReadError(RuntimeError):
+    """Raised when the hardware path is reachable but no valid reading is obtained."""
+
+
 class MultiUSBSensorReader:
     """Reads one sensor per serial device."""
 
@@ -65,7 +69,11 @@ class MultiUSBSensorReader:
             line = connection.readline().decode("ascii", errors="ignore")
             values[name] = parse_sensor_value(line)
         if any(value is None for value in values.values()):
-            raise RuntimeError(f"Incomplete sensor reading: {values}")
+            raise SensorReadError(
+                "Incomplete sensor reading from multi_usb setup. "
+                f"Received: {values}. Check sensor power, USB serial mapping, "
+                "and whether each sensor is streaming valid ASCII current values."
+            )
         return CurrentSample(currents=values, timestamp=time.time())
 
 
@@ -91,6 +99,7 @@ class MultiplexedUARTSensorReader:
             baudrate=self.config.baud_rate,
             timeout=self.config.serial_timeout,
         )
+        self.connection.reset_input_buffer()
         time.sleep(self.config.warmup_seconds)
 
     def close(self) -> None:
@@ -101,10 +110,12 @@ class MultiplexedUARTSensorReader:
 
     def read_currents(self) -> CurrentSample:
         values = {}
-        for name in self.config.ordered_sensor_names():
-            values[name] = self._read_sensor(name)
-        for pin in self.config.rst_pins.values():
-            GPIO.output(pin, GPIO.HIGH)
+        try:
+            for name in self.config.ordered_sensor_names():
+                values[name] = self._read_sensor(name)
+        finally:
+            for pin in self.config.rst_pins.values():
+                GPIO.output(pin, GPIO.HIGH)
         return CurrentSample(currents=values, timestamp=time.time())
 
     def _read_sensor(self, name: str) -> float:
@@ -117,8 +128,10 @@ class MultiplexedUARTSensorReader:
         time.sleep(self.config.buffer_delay_seconds)
 
         last_error = None
+        raw_samples = []
         for _ in range(self.config.read_attempts):
             line = self.connection.readline().decode("ascii", errors="ignore")
+            raw_samples.append(line.strip())
             try:
                 value = parse_sensor_value(line)
             except ValueError as exc:
@@ -126,7 +139,18 @@ class MultiplexedUARTSensorReader:
                 value = None
             if value is not None:
                 return value
-        raise RuntimeError(f"Unable to read {name}: {last_error}")
+        hint = (
+            f"No valid serial data received for {name} on {self.config.uart_port} "
+            f"after {self.config.read_attempts} attempts using RST pin "
+            f"{self.config.rst_pins[name]}. "
+            "Check sensor power, GND, TX-to-RX wiring, UART enable, and the "
+            "RST/enable wiring for this sensor."
+        )
+        if any(raw_samples):
+            hint += f" Raw samples: {raw_samples!r}."
+        if last_error is not None:
+            hint += f" Last parse error: {last_error}."
+        raise SensorReadError(hint)
 
 
 def build_sensor_reader(config: AppConfig):

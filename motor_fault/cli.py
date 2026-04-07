@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from .app import MotorFaultMonitor, configure_logging
 from .config import AppConfig
 from .predictor import MotorFaultPredictor
-from .sensors import build_sensor_reader
+from .sensors import SensorReadError, build_sensor_reader
 
 
 def _cmd_predict(args: argparse.Namespace) -> int:
@@ -30,13 +31,18 @@ def _cmd_test_sensors(args: argparse.Namespace) -> int:
     config = AppConfig()
     reader = build_sensor_reader(config)
     reader.open()
+    failures = 0
     try:
         for index in range(args.samples):
-            sample = reader.read_currents()
-            print(f"sample {index + 1}: {sample.currents}")
+            try:
+                sample = reader.read_currents()
+                print(f"sample {index + 1}: {sample.currents}")
+            except SensorReadError as exc:
+                failures += 1
+                print(f"sample {index + 1}: ERROR: {exc}", file=sys.stderr)
     finally:
         reader.close()
-    return 0
+    return 0 if failures == 0 else 1
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -45,7 +51,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     monitor.open()
     try:
         if args.once:
-            print(json.dumps(monitor.run_once(), indent=2, ensure_ascii=True))
+            try:
+                print(json.dumps(monitor.run_once(), indent=2, ensure_ascii=True))
+            except SensorReadError as exc:
+                print(f"Sensor read failed: {exc}", file=sys.stderr)
+                return 1
         else:
             monitor.run_forever()
     finally:
