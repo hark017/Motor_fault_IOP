@@ -48,6 +48,13 @@ def _env_float(name: str, default: float) -> float:
     return default if raw is None else float(raw)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _detect_model_dir() -> Path:
     root = Path(__file__).resolve().parent.parent
     candidates = (
@@ -73,6 +80,11 @@ class AppConfig:
     settle_delay_seconds: float = _env_float("SENSOR_SETTLE_DELAY_SECONDS", 0.1)
     buffer_delay_seconds: float = _env_float("SENSOR_BUFFER_DELAY_SECONDS", 0.2)
     read_attempts: int = _env_int("SENSOR_READ_ATTEMPTS", 5)
+    sensor_read_fallback_enabled: bool = _env_bool(
+        "SENSOR_READ_FALLBACK_ENABLED",
+        False,
+    )
+    sensor_read_fallback_value: float = _env_float("SENSOR_READ_FALLBACK_VALUE", 0.0)
     sensor_ports: Dict[str, str] = field(
         default_factory=lambda: {
             name: os.getenv(f"{name}_PORT", default)

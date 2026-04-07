@@ -39,6 +39,10 @@ class SensorReadError(RuntimeError):
     """Raised when the hardware path is reachable but no valid reading is obtained."""
 
 
+def _fallback_current(config: AppConfig) -> float:
+    return float(config.sensor_read_fallback_value)
+
+
 class MultiUSBSensorReader:
     """Reads one sensor per serial device."""
 
@@ -69,6 +73,12 @@ class MultiUSBSensorReader:
             line = connection.readline().decode("ascii", errors="ignore")
             values[name] = parse_sensor_value(line)
         if any(value is None for value in values.values()):
+            if self.config.sensor_read_fallback_enabled:
+                values = {
+                    name: _fallback_current(self.config) if value is None else float(value)
+                    for name, value in values.items()
+                }
+                return CurrentSample(currents=values, timestamp=time.time())
             raise SensorReadError(
                 "Incomplete sensor reading from multi_usb setup. "
                 f"Received: {values}. Check sensor power, USB serial mapping, "
@@ -150,6 +160,8 @@ class MultiplexedUARTSensorReader:
             hint += f" Raw samples: {raw_samples!r}."
         if last_error is not None:
             hint += f" Last parse error: {last_error}."
+        if self.config.sensor_read_fallback_enabled:
+            return _fallback_current(self.config)
         raise SensorReadError(hint)
 
 
